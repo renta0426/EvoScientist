@@ -191,7 +191,9 @@ class TestLanggraphCliResolution:
         self._make_executable(path_langgraph)
 
         monkeypatch.setattr(sys, "executable", str(scripts_dir / "python.exe"))
-        monkeypatch.setattr(manager.os, "name", "nt", raising=False)
+        monkeypatch.setattr(
+            manager, "os", SimpleNamespace(**{**vars(manager.os), "name": "nt"})
+        )
         monkeypatch.setattr(
             manager.shutil,
             "which",
@@ -933,7 +935,9 @@ class TestStartLanggraphDevSpawnFlags:
         self, start_langgraph_dev_capture, monkeypatch
     ):
         env = start_langgraph_dev_capture
-        monkeypatch.setattr(manager.os, "name", "nt", raising=False)
+        monkeypatch.setattr(
+            manager, "os", SimpleNamespace(**{**vars(manager.os), "name": "nt"})
+        )
         monkeypatch.setattr(
             manager.subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200, raising=False
         )
@@ -949,7 +953,9 @@ class TestStartLanggraphDevSpawnFlags:
 
     def test_posix_uses_new_session(self, start_langgraph_dev_capture, monkeypatch):
         env = start_langgraph_dev_capture
-        monkeypatch.setattr(manager.os, "name", "posix", raising=False)
+        monkeypatch.setattr(
+            manager, "os", SimpleNamespace(**{**vars(manager.os), "name": "posix"})
+        )
         try:
             manager.start_langgraph_dev(workspace_dir=env.tmp_path)
         except FileNotFoundError:

@@ -564,6 +564,11 @@ def test_stop_inflight_owned_server_stops_the_owned_process(monkeypatch, runtime
     try:
         monkeypatch.setattr(manager, "RUNTIME", runtime_paths)
         monkeypatch.setattr(manager, "_PROCESS", owned)
+        monkeypatch.setattr(
+            manager,
+            "_STARTUP_STATE",
+            manager._StartupState(owned, (None, None, None), {}),
+        )
         assert manager.stop_inflight_owned_server() == owned.pid
         owned.wait(timeout=5)
         assert owned.poll() is not None, "owned in-flight process must be stopped"

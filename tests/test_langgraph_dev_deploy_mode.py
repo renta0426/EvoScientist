@@ -402,14 +402,12 @@ def test_start_records_the_agent_python_in_the_sidecar(
     )
     monkeypatch.setattr(research_env, "agent_python", lambda: "/env/bin/python")
 
-    def _poll():
-        # Called by the health loop, after the sidecar is written.
-        raise _PopenAbort("sidecar written")
-
-    monkeypatch.setattr(
-        subprocess, "Popen", lambda *_a, **_kw: SimpleNamespace(pid=4242, poll=_poll)
-    )
-    with pytest.raises(_PopenAbort):
-        manager.start_langgraph_dev(workspace_dir=tmp_path, port=16179)
+    proc = SimpleNamespace(pid=4242, poll=lambda: None)
+    monkeypatch.setattr(subprocess, "Popen", lambda *_a, **_kw: proc)
+    for name in ("_PROCESS", "_PROCESS_WORKSPACE", "_PROCESS_DEPLOY_MODE"):
+        monkeypatch.setattr(manager, name, None)
+    monkeypatch.setattr(manager, "is_langgraph_dev_running", lambda **_: True)
+    monkeypatch.setattr(manager, "_wait_for_port_bindable", lambda *a, **kw: True)
+    assert manager.start_langgraph_dev(workspace_dir=tmp_path, port=16179) is proc
     sidecar = json.loads((tmp_path / "workspace.json").read_text())
     assert sidecar["agent_python"] == "/env/bin/python"

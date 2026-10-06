@@ -19,8 +19,10 @@ import os
 import re
 import shutil
 import subprocess
+import tempfile
 import threading
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from dataclasses import fields as dataclass_fields
 from pathlib import Path
@@ -278,6 +280,28 @@ def _keepalive_stop_hint(config: EvoScientistConfig) -> str:
     return " If it is a leftover keepalive server, stop it with: EvoSci server stop."
 
 
+@contextmanager
+def _runtime_record_lock():
+    """Serialize record transactions across threads and manager processes.
+
+    This is separate from the lifecycle lock held by ``ensure_langgraph_dev``:
+    direct deploy/launcher starts need the same record protection, but must not
+    hold it while waiting for health (another thread may cancel that start).
+    Always acquire _LOCK first. The singleton file lock makes nested record
+    helpers reentrant in the same thread, including explicit server shutdown.
+    """
+    with (
+        _LOCK,
+        FileLock(
+            str(RUNTIME.lock_file.with_suffix(".records.lock")),
+            timeout=_FILE_LOCK_TIMEOUT,
+            is_singleton=True,
+        ),
+    ):
+        yield
+
+
+@_runtime_record_lock()
 def _write_workspace_sidecar(
     workspace_dir: Path,
     pid: int,
@@ -351,6 +375,7 @@ def _read_workspace_sidecar() -> dict | None:
     return data
 
 
+@_runtime_record_lock()
 def _unlink_workspace_sidecar() -> None:
     """Best-effort sidecar removal — called alongside every ``RUNTIME.pid_file.unlink()``
     so the workspace fingerprint never outlives the PID file it pairs with."""
@@ -579,6 +604,7 @@ def _list_pids_on_port(port: int) -> list[int]:
         return []
 
 
+@_runtime_record_lock()
 def _kill_owned_stale_process(port: int) -> bool:
     """Kill ONLY a previously-owned langgraph dev process bound to ``port``.
 
@@ -766,7 +792,9 @@ def stop_recorded_server() -> int | None:
     was stopped (stale/corrupt files, if any, are still cleaned up).
     """
     try:
-        with FileLock(str(RUNTIME.lock_file), timeout=_FILE_LOCK_TIMEOUT):
+        with FileLock(
+            str(RUNTIME.lock_file), timeout=_FILE_LOCK_TIMEOUT, is_singleton=True
+        ):
             return _stop_recorded_server_locked()
     except FileLockTimeout:
         logger.warning(
@@ -785,19 +813,20 @@ def stop_inflight_owned_server() -> int | None:
     on-disk PID file still names a *different* server — e.g. another
     session's backend on a different port — so killing the recorded
     server on a close-during-boot would take down an unrelated session. The
-    in-memory ``_PROCESS`` is set only by this process's ``start_langgraph_dev``
-    (after Popen), so it can only ever name our own in-flight child; a close
-    before Popen finds it ``None`` and stops nothing. Returns the stopped pid,
-    or ``None`` when we had not spawned anything yet.
+    in-memory startup record names only the active call's child, after Popen.
+    Before that record is published this is a no-op, even if ``_PROCESS`` still
+    names an older healthy server. Returns the stopped pid, or ``None`` when
+    there is no in-flight child. The manager permits one active startup.
     """
     with _LOCK:
-        if _PROCESS is not None and _PROCESS.poll() is None:
-            pid = _PROCESS.pid
-            stop_langgraph_dev()
-            return pid
+        if _STARTUP_STATE is not None and _STARTUP_STATE.proc.poll() is None:
+            proc = _STARTUP_STATE.proc
+            stop_langgraph_dev(proc)
+            return proc.pid
     return None
 
 
+@_runtime_record_lock()
 def _stop_recorded_server_locked() -> int | None:
     with _LOCK:
         if _PROCESS is not None and _PROCESS.poll() is None:
@@ -887,6 +916,89 @@ def _packaged_langgraph_config() -> Path:
 # =============================================================================
 
 
+@dataclass
+class _StartupState:
+    """Remember what the single in-flight start replaced until it is healthy."""
+
+    proc: subprocess.Popen
+    previous: tuple[subprocess.Popen | None, Path | None, bool | None]
+    records: dict[Path, bytes]
+
+
+_STARTUP_STATE: _StartupState | None = None
+_START_IN_PROGRESS = False
+
+
+@contextmanager
+def _startup_lock():
+    """Give every caller the same serialized-start contract as ensure.
+
+    The lifecycle lock spans health polling, but _LOCK and the record lock do
+    not: another thread can still stop the in-flight child immediately.
+    """
+    global _START_IN_PROGRESS
+    RUNTIME.pid_dir.mkdir(parents=True, exist_ok=True)
+    with FileLock(
+        str(RUNTIME.lock_file), timeout=_FILE_LOCK_TIMEOUT, is_singleton=True
+    ):
+        with _LOCK:
+            if _START_IN_PROGRESS:
+                raise RuntimeError("langgraph dev startup is already in progress")
+        try:
+            with _LOCK:
+                _START_IN_PROGRESS = True
+            yield
+        finally:
+            with _LOCK:
+                _START_IN_PROGRESS = False
+
+
+@_runtime_record_lock()
+def _replace_runtime_record(path: Path, content: bytes) -> None:
+    """Publish or restore a complete record without a partial-read window."""
+    with tempfile.NamedTemporaryFile(dir=path.parent, delete=False) as handle:
+        tmp = Path(handle.name)
+        try:
+            handle.write(content)
+            handle.close()
+            os.replace(tmp, path)
+        finally:
+            tmp.unlink(missing_ok=True)
+
+
+def _rollback_startup(proc: subprocess.Popen, startup: _StartupState | None) -> None:
+    """Stop only this call's child and restore records it displaced, if still ours."""
+    global _PROCESS, _PROCESS_WORKSPACE, _PROCESS_DEPLOY_MODE, _STARTUP_STATE
+    with _LOCK:
+        owns_state = startup is not None and (
+            _STARTUP_STATE is startup or _PROCESS is proc
+        )
+        if owns_state:
+            # Detach first so stop does not recursively roll us back.
+            _STARTUP_STATE = None
+        stop_langgraph_dev(proc)
+        if not owns_state:
+            return
+        previous = startup.previous[0]
+        if previous is not None and previous.poll() is None:
+            _PROCESS, _PROCESS_WORKSPACE, _PROCESS_DEPLOY_MODE = startup.previous
+
+        with _runtime_record_lock():
+            # A keepalive server can have records without an in-memory handle.
+            # Restore only a still-live record, and never overwrite another start's
+            # newly published files. Normal publication and rollback hold _LOCK.
+            try:
+                pid = int(startup.records.get(RUNTIME.pid_file, b""))
+            except ValueError:
+                return
+            if pid <= 0 or not psutil.pid_exists(pid):
+                return
+            for path, content in startup.records.items():
+                if not path.exists():
+                    _replace_runtime_record(path, content)
+
+
+@_startup_lock()
 def start_langgraph_dev(
     workspace_dir: Path | None = None,
     *,
@@ -930,7 +1042,7 @@ def start_langgraph_dev(
             is missing.
         RuntimeError: If langgraph dev exits early or never becomes healthy.
     """
-    global _PROCESS
+    global _PROCESS, _PROCESS_WORKSPACE, _PROCESS_DEPLOY_MODE, _STARTUP_STATE
 
     exe = _langgraph_exe()
     if exe is None:
@@ -1113,90 +1225,115 @@ def start_langgraph_dev(
     else:
         _spawn_kwargs = {"start_new_session": True}
 
+    proc = None
+    startup = None
     try:
-        logger.info("Starting langgraph dev with CLI: %s", exe)
-        proc = subprocess.Popen(
-            [
-                exe,
-                "dev",
-                "--config",
-                str(config_file),
-                "--host",
-                host,
-                "--port",
-                str(port),
-                "--n-jobs-per-worker",
-                str(jobs_per_worker),
-                "--no-browser",
-                "--no-reload",
-                *(["--tunnel"] if tunnel else []),
-            ],
-            cwd=str(workspace_dir),
-            stdout=log_handle,
-            stderr=log_handle,
-            env=sub_env,
-            **_spawn_kwargs,
-        )
-    finally:
-        # The child has its own copy of the fd; closing ours prevents an
-        # accumulating leak across restarts. Run even if Popen raises.
         try:
-            log_handle.close()
-        except Exception:
-            pass
-    RUNTIME.pid_file.write_text(str(proc.pid), encoding="utf-8")
-    from EvoScientist.setup.research_env import agent_python
-
-    _write_workspace_sidecar(
-        workspace_dir=workspace_dir,
-        pid=proc.pid,
-        config_fingerprint=config_fingerprint,
-        deploy_mode=deploy_mode,
-        # The server inherits this process's environment, so it resolves the
-        # same python.
-        agent_python=agent_python(),
-    )
-    global _PROCESS_WORKSPACE, _PROCESS_DEPLOY_MODE
-    _PROCESS = proc
-    _PROCESS_WORKSPACE = workspace_dir
-    _PROCESS_DEPLOY_MODE = deploy_mode
-
-    # langgraph dev cold-starts in ~10-15s normally; first-time npx-based MCP
-    # servers can push this to 30-60s while npm fetches packages, so the budget
-    # is generous. Subsequent runs are much faster thanks to npm cache.
-    deadline = time.monotonic() + 60
-    while time.monotonic() < deadline:
-        if proc.poll() is not None:
-            tail = ""
+            logger.info("Starting langgraph dev with CLI: %s", exe)
+            proc = subprocess.Popen(
+                [
+                    exe,
+                    "dev",
+                    "--config",
+                    str(config_file),
+                    "--host",
+                    host,
+                    "--port",
+                    str(port),
+                    "--n-jobs-per-worker",
+                    str(jobs_per_worker),
+                    "--no-browser",
+                    "--no-reload",
+                    *(["--tunnel"] if tunnel else []),
+                ],
+                cwd=str(workspace_dir),
+                stdout=log_handle,
+                stderr=log_handle,
+                env=sub_env,
+                **_spawn_kwargs,
+            )
+        finally:
+            # The child has its own copy of the fd; closing ours prevents an
+            # accumulating leak across restarts. Run even if Popen raises.
             try:
-                tail = RUNTIME.log_file.read_text(encoding="utf-8", errors="replace")[
-                    -2000:
-                ]
+                log_handle.close()
             except Exception:
                 pass
-            # Subprocess died on its own — clear our module-level bookkeeping
-            # (``_PROCESS``, ``_PROCESS_WORKSPACE``, ``RUNTIME.pid_file``) before
-            # raising. Without this, ``_PROCESS`` would keep pointing at the
-            # dead handle and ``RUNTIME.pid_file`` at a non-existent PID, leading
-            # the next ``ensure_langgraph_dev`` to misjudge state. Pass
-            # ``proc`` directly so ``stop_langgraph_dev`` works against the
-            # one we just spawned even if the global state was overwritten.
-            stop_langgraph_dev(proc)
-            raise RuntimeError(
-                f"langgraph dev exited immediately with code {proc.returncode}.\n"
-                f"Log tail:\n{tail}"
+        with _runtime_record_lock():
+            records = {}
+            for path in (RUNTIME.pid_file, RUNTIME.workspace_sidecar):
+                try:
+                    records[path] = path.read_bytes()
+                except FileNotFoundError:
+                    pass
+            startup = _StartupState(
+                proc, (_PROCESS, _PROCESS_WORKSPACE, _PROCESS_DEPLOY_MODE), records
             )
-        if is_langgraph_dev_running(port=port, host=host):
-            logger.info(
-                "langgraph dev started on %s (pid=%d)", _base_url(port, host), proc.pid
-            )
-            return proc
-        time.sleep(0.5)
+            _STARTUP_STATE = startup
+            _PROCESS = proc
+            _PROCESS_WORKSPACE = workspace_dir
+            _PROCESS_DEPLOY_MODE = deploy_mode
+            _replace_runtime_record(RUNTIME.pid_file, str(proc.pid).encode("utf-8"))
+            from EvoScientist.setup.research_env import agent_python
 
-    stop_langgraph_dev(proc)
-    raise RuntimeError(
-        f"langgraph dev did not become healthy within 60 seconds. Check {RUNTIME.log_file}"
-    )
+            _write_workspace_sidecar(
+                workspace_dir=workspace_dir,
+                pid=proc.pid,
+                config_fingerprint=config_fingerprint,
+                deploy_mode=deploy_mode,
+                # The server inherits this process's environment, so it resolves the
+                # same python.
+                agent_python=agent_python(),
+            )
+
+        # langgraph dev cold-starts in ~10-15s normally; first-time npx-based MCP
+        # servers can push this to 30-60s while npm fetches packages, so the budget
+        # is generous. Subsequent runs are much faster thanks to npm cache.
+        deadline = time.monotonic() + 60
+        while time.monotonic() < deadline:
+            if proc.poll() is not None:
+                tail = ""
+                try:
+                    tail = RUNTIME.log_file.read_text(
+                        encoding="utf-8", errors="replace"
+                    )[-2000:]
+                except Exception:
+                    pass
+                # Subprocess died on its own — clear our module-level bookkeeping
+                # (``_PROCESS``, ``_PROCESS_WORKSPACE``, ``RUNTIME.pid_file``) before
+                # raising. Without this, ``_PROCESS`` would keep pointing at the
+                # dead handle and ``RUNTIME.pid_file`` at a non-existent PID, leading
+                # the next ``ensure_langgraph_dev`` to misjudge state. Pass
+                # ``proc`` directly so ``stop_langgraph_dev`` works against the
+                # one we just spawned even if the global state was overwritten.
+                raise RuntimeError(
+                    f"langgraph dev exited immediately with code {proc.returncode}.\n"
+                    f"Log tail:\n{tail}"
+                )
+            if is_langgraph_dev_running(port=port, host=host):
+                logger.info(
+                    "langgraph dev started on %s (pid=%d)",
+                    _base_url(port, host),
+                    proc.pid,
+                )
+                with _LOCK:
+                    if proc.poll() is not None:
+                        raise RuntimeError("langgraph dev was stopped during startup")
+                    _STARTUP_STATE = None
+                return proc
+            time.sleep(0.5)
+
+        raise RuntimeError(
+            f"langgraph dev did not become healthy within 60 seconds. Check {RUNTIME.log_file}"
+        )
+    except BaseException:
+        if proc is not None:
+            try:
+                _rollback_startup(proc, startup)
+            except Exception:
+                # Keep the initiating exception (especially Ctrl+C) visible.
+                logger.exception("Failed to clean up interrupted langgraph dev startup")
+        raise
 
 
 def read_tunnel_url(timeout: float = 35.0, poll_interval: float = 0.5) -> str | None:
@@ -1246,6 +1383,13 @@ def stop_langgraph_dev(proc: subprocess.Popen | None = None) -> None:
     global _PROCESS, _PROCESS_WORKSPACE, _PROCESS_DEPLOY_MODE
     with _LOCK:
         proc = proc if proc is not None else _PROCESS
+        startup = _STARTUP_STATE
+        if startup is not None and startup.proc is proc:
+            # Complete cancellation before another start snapshots our state.
+            # Otherwise it could capture the empty gap between stopping this
+            # child and the health-wait thread handling its exception.
+            _rollback_startup(proc, startup)
+            return
         if proc is None:
             # No live process to stop, but stale PID/sidecar files may still
             # be on disk from a previous run that died unexpectedly — fall
@@ -1258,6 +1402,7 @@ def stop_langgraph_dev(proc: subprocess.Popen | None = None) -> None:
                 # because POSIX process groups (``os.killpg``) don't exist on
                 # Windows. ``psutil.Process.children(recursive=True)`` works on
                 # both — we mirror the previous SIGTERM-then-SIGKILL escalation.
+                descendants = []
                 try:
                     parent = psutil.Process(proc.pid)
                     descendants = parent.children(recursive=True)
@@ -1289,16 +1434,33 @@ def stop_langgraph_dev(proc: subprocess.Popen | None = None) -> None:
                     except subprocess.TimeoutExpired:
                         pass
 
+                # A parent may exit before workers that ignore SIGTERM.
+                # Revisit the original snapshot: orphaned workers no longer
+                # appear in parent.children() after the parent has exited.
+                for child in descendants:
+                    try:
+                        if child.is_running():
+                            child.kill()
+                    except (psutil.NoSuchProcess, psutil.AccessDenied):
+                        pass
+
             if proc is _PROCESS:
                 _PROCESS = None
                 _PROCESS_WORKSPACE = None
                 _PROCESS_DEPLOY_MODE = None
-    if RUNTIME.pid_file.exists():
-        try:
-            RUNTIME.pid_file.unlink()
-        except OSError:
-            pass
-    _unlink_workspace_sidecar()
+        with _runtime_record_lock():
+            # An explicit old handle must not erase a newer server's records.
+            # Keep these checks and removals inside the same state-mutation lock.
+            try:
+                if proc is None or RUNTIME.pid_file.read_text(
+                    encoding="utf-8"
+                ).strip() == str(proc.pid):
+                    RUNTIME.pid_file.unlink(missing_ok=True)
+            except OSError:
+                pass
+            sidecar = _read_workspace_sidecar()
+            if proc is None or (sidecar is not None and sidecar.get("pid") == proc.pid):
+                _unlink_workspace_sidecar()
 
     # Note: ``.langgraph_api/`` is intentionally NOT removed — it holds
     # langgraph dev's persisted async-task / scheduler / Store state that
@@ -1361,7 +1523,9 @@ def ensure_langgraph_dev(
     #      inside the critical section.
     RUNTIME.pid_dir.mkdir(parents=True, exist_ok=True)
     try:
-        with FileLock(str(RUNTIME.lock_file), timeout=_FILE_LOCK_TIMEOUT):
+        with FileLock(
+            str(RUNTIME.lock_file), timeout=_FILE_LOCK_TIMEOUT, is_singleton=True
+        ):
             with _LOCK:
                 return _ensure_langgraph_dev_locked(config, workspace_dir, backend)
     except FileLockTimeout:
